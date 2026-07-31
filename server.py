@@ -444,6 +444,16 @@ async def diagnostic_tv_state():
     """Return read-only Art Mode state for troubleshooting."""
 
     try:
+        async def slideshow_status():
+            try:
+                return await _tv_op(
+                    lambda art: art.get_slideshow_status()
+                )
+            except ResponseError:
+                return await _tv_op(
+                    lambda art: art.get_auto_rotation_status()
+                )
+
         return {
             "artmode": await _tv_op(
                 lambda art: art.get_artmode()
@@ -451,6 +461,7 @@ async def diagnostic_tv_state():
             "rotation": await _tv_op(
                 lambda art: art.get_rotation()
             ),
+            "slideshow": await slideshow_status(),
             "current_artwork": await _tv_op(
                 lambda art: art.get_current()
             ),
