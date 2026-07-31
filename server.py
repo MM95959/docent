@@ -439,6 +439,40 @@ async def tv_info():
         raise HTTPException(502, "Cannot reach TV — is it on and connected?")
 
 
+@app.get("/api/diagnostics/tv-state")
+async def diagnostic_tv_state():
+    """Return read-only Art Mode state for troubleshooting."""
+
+    def _diagnostics(art):
+        result = {}
+
+        checks = {
+            "artmode": art.get_artmode,
+            "rotation": art.get_rotation,
+            "current_artwork": art.get_current,
+        }
+
+        for name, operation in checks.items():
+            try:
+                result[name] = operation()
+            except Exception as exc:
+                result[name] = None
+                result[f"{name}_error"] = (
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        return result
+
+    try:
+        return await _tv_op(_diagnostics)
+    except Exception as exc:
+        log.warning("TV diagnostic failed: %s", exc)
+        raise HTTPException(
+            502,
+            "Cannot read diagnostic state from TV",
+        )
+
+
 @app.get("/api/device-info")
 async def device_info():
     try:
