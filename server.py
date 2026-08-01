@@ -474,6 +474,37 @@ async def diagnostic_tv_state():
         )
 
 
+@app.post("/api/diagnostics/resume-slideshow")
+async def diagnostic_resume_slideshow():
+    """Temporarily resume the slideshow using the current artwork's category."""
+
+    try:
+        current = await _tv_op(lambda art: art.get_current())
+        category_id = current.get("category_id", "MY-C0002")
+
+        result = await _tv_op(
+            lambda art: art.set_slideshow_status(
+                duration=3,
+                type=True,
+                category_id=category_id,
+            )
+        )
+
+        return {
+            "ok": True,
+            "duration_minutes": 3,
+            "shuffle": True,
+            "category_id": category_id,
+            "tv_response": result,
+        }
+    except Exception as exc:
+        log.warning("Resume-slideshow diagnostic failed: %s", exc)
+        raise HTTPException(
+            502,
+            "Cannot resume slideshow on TV",
+        )
+
+
 @app.get("/api/device-info")
 async def device_info():
     try:
