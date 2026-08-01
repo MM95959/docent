@@ -474,34 +474,48 @@ async def diagnostic_tv_state():
         )
 
 
-@app.post("/api/diagnostics/resume-slideshow")
-async def diagnostic_resume_slideshow():
-    """Temporarily resume the slideshow using the current artwork's category."""
+@app.post("/api/slideshow/resume")
+async def resume_slideshow():
+    """Restore the slideshow configuration saved before manual selection."""
+
+    global _current_id_cache, _saved_slideshow_session
+
+    if _saved_slideshow_session is None:
+        raise HTTPException(
+            409,
+            "No saved slideshow session is available",
+        )
+
+    session = dict(_saved_slideshow_session)
 
     try:
-        current = await _tv_op(lambda art: art.get_current())
-        category_id = current.get("category_id", "MY-C0002")
-
         result = await _tv_op(
             lambda art: art.set_slideshow_status(
-                duration=3,
-                type=True,
-                category_id=category_id,
+                duration=session["duration_minutes"],
+                type=session["shuffle"],
+                category_id=session["category_id"],
             )
         )
 
+        current = await _tv_op(lambda art: art.get_current())
+        if isinstance(current, dict):
+            _current_id_cache = current.get("content_id")
+
+        # Clear the saved state only after Samsung confirms restoration.
+        _saved_slideshow_session = None
+
         return {
             "ok": True,
-            "duration_minutes": 3,
-            "shuffle": True,
-            "category_id": category_id,
+            "restored": session,
+            "current_artwork": current,
             "tv_response": result,
         }
     except Exception as exc:
-        log.warning("Resume-slideshow diagnostic failed: %s", exc)
+        # Retain the saved session so restoration can be retried.
+        log.warning("Resume slideshow failed: %s", exc)
         raise HTTPException(
             502,
-            "Cannot resume slideshow on TV",
+            "Cannot restore slideshow on TV",
         )
 
 
@@ -801,18 +815,67 @@ async def thumbnails_diag():
     }
 
 
+# Slideshow configuration captured immediately before a manual artwork
+# selection pauses playback. Kept in memory until successfully restored.
+_saved_slideshow_session: dict | None = None
+
+
 # --- Select / display ---
 
 @app.post("/api/select")
 async def select_art(body: dict):
-    global _current_id_cache
+    global _current_id_cache, _saved_slideshow_session
+
     content_id = body.get("content_id")
     if not content_id:
         raise HTTPException(400, "content_id required")
     _validate_content_id(content_id)
+
+    # Capture the active slideshow before Samsung's select_image request
+    # pauses it. If playback is already off, retain any session captured
+    # by an earlier manual selection rather than overwriting it.
+    try:
+        status = await _tv_op(lambda art: art.get_slideshow_status())
+
+        if isinstance(status, dict):
+            value = str(status.get("value") or "").strip()
+            category_id = str(status.get("category_id") or "").strip()
+            slideshow_type = str(status.get("type") or "").strip()
+
+            if (
+                value
+                and value != "off"
+                and category_id
+                and slideshow_type in ("slideshow", "shuffleslideshow")
+            ):
+                try:
+                    duration_minutes = int(value)
+                except (TypeError, ValueError):
+                    duration_minutes = 0
+
+                if duration_minutes > 0:
+                    _saved_slideshow_session = {
+                        "duration_minutes": duration_minutes,
+                        "shuffle": slideshow_type == "shuffleslideshow",
+                        "category_id": category_id,
+                    }
+    except Exception as exc:
+        # Failure to inspect playback must not prevent manual display.
+        log.warning(
+            "Could not capture slideshow state before selecting %s: %s",
+            content_id,
+            exc,
+        )
+
     await _tv_op(lambda art: art.select_image(content_id, show=True))
     _current_id_cache = content_id
-    return {"ok": True, "content_id": content_id}
+
+    return {
+        "ok": True,
+        "content_id": content_id,
+        "slideshow_session_saved": _saved_slideshow_session is not None,
+        "saved_slideshow_session": _saved_slideshow_session,
+    }
 
 
 # --- Upload ---
