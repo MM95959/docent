@@ -478,40 +478,18 @@ async def diagnostic_tv_state():
 async def resume_slideshow():
     """Restore the slideshow configuration saved before manual selection."""
 
-    global _current_id_cache, _saved_slideshow_session
+    global _auto_resume_task
 
-    if _saved_slideshow_session is None:
-        raise HTTPException(
-            409,
-            "No saved slideshow session is available",
-        )
-
-    session = dict(_saved_slideshow_session)
+    # A manual resume supersedes any pending automatic resume.
+    if _auto_resume_task is not None:
+        _auto_resume_task.cancel()
+        _auto_resume_task = None
 
     try:
-        result = await _tv_op(
-            lambda art: art.set_slideshow_status(
-                duration=session["duration_minutes"],
-                type=session["shuffle"],
-                category_id=session["category_id"],
-            )
-        )
-
-        current = await _tv_op(lambda art: art.get_current())
-        if isinstance(current, dict):
-            _current_id_cache = current.get("content_id")
-
-        # Clear the saved state only after Samsung confirms restoration.
-        _saved_slideshow_session = None
-
-        return {
-            "ok": True,
-            "restored": session,
-            "current_artwork": current,
-            "tv_response": result,
-        }
+        return await _restore_saved_slideshow()
+    except HTTPException:
+        raise
     except Exception as exc:
-        # Retain the saved session so restoration can be retried.
         log.warning("Resume slideshow failed: %s", exc)
         raise HTTPException(
             502,
@@ -819,17 +797,100 @@ async def thumbnails_diag():
 # selection pauses playback. Kept in memory until successfully restored.
 _saved_slideshow_session: dict | None = None
 
+# Optional delayed restoration task. A new Display on Frame request cancels
+# and replaces any existing timer.
+_auto_resume_task: asyncio.Task | None = None
+
+
+async def _restore_saved_slideshow() -> dict:
+    """Restore and clear the saved slideshow session after TV confirmation."""
+
+    global _current_id_cache, _saved_slideshow_session
+
+    if _saved_slideshow_session is None:
+        raise HTTPException(
+            409,
+            "No saved slideshow session is available",
+        )
+
+    session = dict(_saved_slideshow_session)
+
+    result = await _tv_op(
+        lambda art: art.set_slideshow_status(
+            duration=session["duration_minutes"],
+            type=session["shuffle"],
+            category_id=session["category_id"],
+        )
+    )
+
+    current = await _tv_op(lambda art: art.get_current())
+    if isinstance(current, dict):
+        _current_id_cache = current.get("content_id")
+
+    # Clear only after Samsung confirms restoration.
+    _saved_slideshow_session = None
+
+    return {
+        "ok": True,
+        "restored": session,
+        "current_artwork": current,
+        "tv_response": result,
+    }
+
+
+async def _auto_resume_after(delay_seconds: int) -> None:
+    """Wait, then restore the saved slideshow unless the timer is replaced."""
+
+    global _auto_resume_task
+
+    try:
+        await asyncio.sleep(delay_seconds)
+        await _restore_saved_slideshow()
+        log.info(
+            "Automatically restored slideshow after %d seconds",
+            delay_seconds,
+        )
+    except asyncio.CancelledError:
+        log.debug("Pending automatic slideshow resume was cancelled")
+        raise
+    except Exception as exc:
+        # Keep the saved session so the user can retry with manual Resume.
+        log.warning("Automatic slideshow resume failed: %s", exc)
+    finally:
+        if _auto_resume_task is asyncio.current_task():
+            _auto_resume_task = None
+
 
 # --- Select / display ---
 
 @app.post("/api/select")
 async def select_art(body: dict):
-    global _current_id_cache, _saved_slideshow_session
+    global _current_id_cache, _saved_slideshow_session, _auto_resume_task
 
     content_id = body.get("content_id")
     if not content_id:
         raise HTTPException(400, "content_id required")
     _validate_content_id(content_id)
+
+    auto_resume_seconds = body.get("auto_resume_seconds", 0)
+    try:
+        auto_resume_seconds = int(auto_resume_seconds)
+    except (TypeError, ValueError):
+        raise HTTPException(
+            400,
+            "auto_resume_seconds must be an integer",
+        )
+
+    if auto_resume_seconds < 0 or auto_resume_seconds > 86400:
+        raise HTTPException(
+            400,
+            "auto_resume_seconds must be between 0 and 86400",
+        )
+
+    # A new manual selection replaces any previously scheduled resume.
+    if _auto_resume_task is not None:
+        _auto_resume_task.cancel()
+        _auto_resume_task = None
 
     # Capture the active slideshow before Samsung's select_image request
     # pauses it. If playback is already off, retain any session captured
@@ -870,11 +931,20 @@ async def select_art(body: dict):
     await _tv_op(lambda art: art.select_image(content_id, show=True))
     _current_id_cache = content_id
 
+    auto_resume_scheduled = False
+    if auto_resume_seconds > 0 and _saved_slideshow_session is not None:
+        _auto_resume_task = asyncio.create_task(
+            _auto_resume_after(auto_resume_seconds)
+        )
+        auto_resume_scheduled = True
+
     return {
         "ok": True,
         "content_id": content_id,
         "slideshow_session_saved": _saved_slideshow_session is not None,
         "saved_slideshow_session": _saved_slideshow_session,
+        "auto_resume_seconds": auto_resume_seconds,
+        "auto_resume_scheduled": auto_resume_scheduled,
     }
 
 
