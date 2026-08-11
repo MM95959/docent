@@ -89,6 +89,7 @@ log = logging.getLogger("docent")
 _art_cache: list[dict] | None = None
 _current_id_cache: str | None = None
 _tv_lock = asyncio.Lock()
+_tv_interactive_waiters: int = 0
 _tv_conn: SamsungTVWS | None = None
 _tv_art = None
 _tv_last_used: float = 0
@@ -188,27 +189,29 @@ def _wake_tv() -> None:
         log.debug("WoL send failed: %s", e)
 
 
-async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | None = None):
+async def _tv_op(
+    fn,
+    *,
+    attempts: int = TV_CONNECT_ATTEMPTS,
+    timeout: float | None = None,
+    low_priority: bool = False,
+):
     """Run a blocking TV operation off the event loop, reliably.
 
-    Reuses a persistent TV/art WebSocket connection, running ``fn(art)`` in a
-    worker thread. Access is serialized by ``_tv_lock`` so only one TV
-    conversation happens at a time (the Frame dislikes concurrent
-    connections), while the event loop stays free to serve other requests.
+    Reuses a persistent TV/art WebSocket connection and serializes access
+    through ``_tv_lock`` because the Frame dislikes concurrent conversations.
 
-    Each attempt is bounded by ``timeout`` (default ``TV_TIMEOUT + 8``) so a
-    hung connection can never hold the lock forever — it raises and releases.
-    On failure the connection is closed (so the next attempt opens a fresh
-    one), a Wake-on-LAN packet is sent, and the lock is **released** during
-    the retry delay so other operations aren't starved.
+    Interactive operations have priority over background/cache work.
+    Low-priority callers wait while an interactive operation is pending,
+    preventing new thumbnail work from getting ahead of user actions.
 
-    A definitive ``ResponseError`` from the TV (e.g. the matte "-10"
-    rejection) is not retried.
+    A low-priority operation that is already holding the lock cannot be
+    preempted, so thumbnail callers should also use a short timeout.
 
-    Pass ``attempts=1`` for non-idempotent calls like uploads (so a lost
-    response can't trigger a duplicate), with a larger ``timeout`` to allow
-    the data transfer.
+    A definitive ``ResponseError`` from the TV is not retried.
     """
+    global _tv_interactive_waiters, _tv_last_used
+
     if timeout is None:
         timeout = TV_TIMEOUT + 8
 
@@ -216,29 +219,63 @@ async def _tv_op(fn, *, attempts: int = TV_CONNECT_ATTEMPTS, timeout: float | No
         art = _ensure_tv_connection()
         return fn(art)
 
-    last_exc: Exception | None = None
-    for attempt in range(attempts):
-        async with _tv_lock:
+    if not low_priority:
+        _tv_interactive_waiters += 1
+
+    try:
+        last_exc: Exception | None = None
+
+        for attempt in range(attempts):
+            if low_priority:
+                # Do not let cache work get ahead of an interactive request.
+                # Recheck after acquiring the lock to close the race between
+                # observing zero waiters and actually obtaining TV access.
+                while True:
+                    while _tv_interactive_waiters > 0:
+                        await asyncio.sleep(0.1)
+
+                    await _tv_lock.acquire()
+
+                    if _tv_interactive_waiters == 0:
+                        break
+
+                    _tv_lock.release()
+                    await asyncio.sleep(0)
+            else:
+                await _tv_lock.acquire()
+
             try:
-                result = await asyncio.wait_for(asyncio.to_thread(_job), timeout=timeout)
-                global _tv_last_used
-                _tv_last_used = time.monotonic()
-                return result
-            except ResponseError:
-                raise  # TV answered with a definitive error — retrying won't help
-            except Exception as e:
-                last_exc = e
-                _close_tv_connection()
-        # Lock released — other operations can proceed during retry delay
-        if attempt + 1 < attempts:
-            log.info(
-                "TV op attempt %d/%d failed (%s) — waking TV and retrying",
-                attempt + 1, attempts, type(last_exc).__name__,
-            )
-            _wake_tv()
-            await asyncio.sleep(TV_RETRY_DELAY)
-    assert last_exc is not None
-    raise last_exc
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.to_thread(_job),
+                        timeout=timeout,
+                    )
+                    _tv_last_used = time.monotonic()
+                    return result
+                except ResponseError:
+                    raise
+                except Exception as e:
+                    last_exc = e
+                    _close_tv_connection()
+            finally:
+                _tv_lock.release()
+
+            if attempt + 1 < attempts:
+                log.info(
+                    "TV op attempt %d/%d failed (%s) — waking TV and retrying",
+                    attempt + 1,
+                    attempts,
+                    type(last_exc).__name__,
+                )
+                _wake_tv()
+                await asyncio.sleep(TV_RETRY_DELAY)
+
+        assert last_exc is not None
+        raise last_exc
+
+    finally:
+        if not low_priority:
+            _tv_interactive_waiters -= 1
 
 
 def _save_thumbnail(content_id: str, data: bytes | bytearray) -> None:
@@ -538,7 +575,12 @@ async def get_thumbnail(content_id: str):
     cached = _get_cached_thumbnail(content_id)
     if cached:
         return Response(content=cached, media_type="image/jpeg")
-    data = await _tv_op(lambda art: art.get_thumbnail(content_id))
+    data = await _tv_op(
+        lambda art: art.get_thumbnail(content_id),
+        attempts=1,
+        timeout=_THUMBNAIL_TV_TIMEOUT,
+        low_priority=True,
+    )
     if not data:
         raise HTTPException(404, "No thumbnail")
     _save_thumbnail(content_id, data)
@@ -558,6 +600,7 @@ _PREFETCH_INTER_DELAY = 0.5  # seconds between successful fetches
 _PREFETCH_BACKOFF = 2  # multiplier for consecutive failure delays
 _PREFETCH_MAX_FAILURES = 5  # abort after this many consecutive failures
 _PREFETCH_RETRY_COOLDOWN = 300  # seconds before auto-retrying a failed prefetch
+_THUMBNAIL_TV_TIMEOUT = 8  # cache work must not monopolize interactive TV access
 
 
 async def _prefetch_thumbnails(content_ids: list[str], *, source: str = "fallback") -> None:
@@ -600,6 +643,8 @@ async def _prefetch_thumbnails(content_ids: list[str], *, source: str = "fallbac
                 data = await _tv_op(
                     lambda art, _cid=cid: art.get_thumbnail(_cid),
                     attempts=1,
+                    timeout=_THUMBNAIL_TV_TIMEOUT,
+                    low_priority=True,
                 )
                 if data:
                     _save_thumbnail(cid, data)
@@ -723,6 +768,8 @@ async def get_thumbnails_batch(body: dict):
                 result = await _tv_op(
                     lambda art: art.get_thumbnail_list(missing),
                     attempts=1,
+                    timeout=_THUMBNAIL_TV_TIMEOUT,
+                    low_priority=True,
                 )
                 for name, data in result.items():
                     for cid in missing:
@@ -743,7 +790,10 @@ async def get_thumbnails_batch(body: dict):
                 cid for cid in missing
                 if cid not in encoded and cid not in _thumb_prefetch_in_progress
             ]
-            if to_prefetch and not _thumb_prefetch_running:
+            if (
+                to_prefetch
+                and not _thumb_prefetch_running
+            ):
                 _thumb_prefetch_running = True  # set BEFORE create_task to prevent races
                 _thumb_prefetch_in_progress.update(to_prefetch)
                 asyncio.create_task(_prefetch_thumbnails(to_prefetch))
@@ -769,7 +819,10 @@ async def retry_thumbnails(body: dict):
             cid for cid in content_ids
             if not _get_cached_thumbnail(cid) and cid not in _thumb_prefetch_in_progress
         ]
-        if to_prefetch and not _thumb_prefetch_running:
+        if (
+            to_prefetch
+            and not _thumb_prefetch_running
+        ):
             _thumb_prefetch_running = True  # set BEFORE create_task to prevent races
             _thumb_prefetch_in_progress.update(to_prefetch)
             asyncio.create_task(_prefetch_thumbnails(to_prefetch))
