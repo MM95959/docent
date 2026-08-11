@@ -138,7 +138,8 @@ EOF
     AI_KEY=""
 
     prompt_input
-    case "${REPLY,,}" in
+    reply_lower=$(printf '%s' "$REPLY" | tr '[:upper:]' '[:lower:]')
+    case "$reply_lower" in
         c|claude)
             AI_PROVIDER="claude"
             echo ""
