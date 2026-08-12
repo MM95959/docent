@@ -3214,25 +3214,30 @@
             }
           }
           if (_thumbFallbackSeen) _updateThumbProgress();
-          // Retry missing IDs returned by the server
+          // If the server entered fallback mode, stop automatic retries.
+          // Missing thumbnails remain user-retryable placeholders rather
+          // than generating a continuing stream of TV requests.
           const stillMissing = (data.missing || []).filter(id => !thumbCache[id]);
-          if (stillMissing.length && attempt + 1 < MAX_ATTEMPTS) {
-            setTimeout(() => loadThumbnailBatch(stillMissing, attempt + 1), retryDelay(attempt));
-          } else {
-            // Final attempt exhausted — mark failures as resolved for progress
+          if (_thumbFallbackSeen) {
             for (const id of stillMissing) {
               showThumbError(id);
               _thumbResolvedIds.add(id);
             }
-            if (stillMissing.length && _thumbFallbackSeen) _updateThumbProgress();
+            if (stillMissing.length) _updateThumbProgress();
+          } else if (stillMissing.length && attempt + 1 < MAX_ATTEMPTS) {
+            setTimeout(() => loadThumbnailBatch(stillMissing, attempt + 1), retryDelay(attempt));
+          } else {
+            for (const id of stillMissing) {
+              showThumbError(id);
+              _thumbResolvedIds.add(id);
+            }
           }
         } catch {
           clearTimeout(timer);
-          if (attempt + 1 < MAX_ATTEMPTS) {
+          if (!_thumbFallbackSeen && attempt + 1 < MAX_ATTEMPTS) {
             const retryIds = batch.filter(id => !thumbCache[id]);
             setTimeout(() => loadThumbnailBatch(retryIds, attempt + 1), retryDelay(attempt));
           } else {
-            // Final attempt exhausted — mark failures as resolved for progress
             for (const id of batch) {
               if (!thumbCache[id]) {
                 showThumbError(id);

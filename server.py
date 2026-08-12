@@ -386,13 +386,9 @@ async def lifespan(app: FastAPI):
     else:
         log.info("Docent starting — TV at %s:%s", TV_IP, TV_PORT)
 
-    # Kick off background thumbnail prefetch after startup so the disk
-    # cache warms up before a user opens the browser.  This is the key
-    # fix for large catalogs with unreliable TV connections: the cache
-    # fills gradually in the background instead of being demanded by a
-    # page load.
-    if TV_IP:
-        asyncio.create_task(_startup_prefetch())
+    # Do not automatically prefetch thumbnails from the TV at startup.
+    # Some Frame models become unreliable under sustained thumbnail traffic.
+    # Thumbnails are loaded on demand by the UI instead.
 
     yield
 
@@ -575,12 +571,16 @@ async def get_thumbnail(content_id: str):
     cached = _get_cached_thumbnail(content_id)
     if cached:
         return Response(content=cached, media_type="image/jpeg")
-    data = await _tv_op(
-        lambda art: art.get_thumbnail(content_id),
-        attempts=1,
-        timeout=_THUMBNAIL_TV_TIMEOUT,
-        low_priority=True,
-    )
+    try:
+        data = await _tv_op(
+            lambda art: art.get_thumbnail(content_id),
+            attempts=1,
+            timeout=_THUMBNAIL_TV_TIMEOUT,
+            low_priority=True,
+        )
+    except Exception as e:
+        log.warning("Single thumbnail fetch failed for %s: %s", content_id, e)
+        raise HTTPException(502, "Thumbnail unavailable from TV")
     if not data:
         raise HTTPException(404, "No thumbnail")
     _save_thumbnail(content_id, data)
@@ -595,6 +595,7 @@ _thumb_prefetch_running: bool = False
 # Circuit breaker for get_thumbnail_list — if the batch call fails, skip
 # it for a cooldown period so retries return the cache instantly.
 _batch_thumb_last_failure: float = 0
+_batch_thumb_in_progress: bool = False
 _BATCH_THUMB_COOLDOWN = 60  # seconds
 _PREFETCH_INTER_DELAY = 0.5  # seconds between successful fetches
 _PREFETCH_BACKOFF = 2  # multiplier for consecutive failure delays
@@ -736,7 +737,7 @@ async def _startup_prefetch() -> None:
 
 @app.post("/api/thumbnails")
 async def get_thumbnails_batch(body: dict):
-    global _thumb_prefetch_running
+    global _thumb_prefetch_running, _batch_thumb_in_progress
     content_ids = body.get("content_ids", [])
     if not content_ids:
         return {"thumbnails": {}, "missing": [], "fallback": False}
@@ -759,11 +760,15 @@ async def get_thumbnails_batch(body: dict):
         # endpoint from blocking 8-60s on a call that will definitely fail,
         # which is what was causing the 69-131s response times.
         since_last_failure = time.monotonic() - _batch_thumb_last_failure
-        skip_batch = since_last_failure < _BATCH_THUMB_COOLDOWN
+        skip_batch = (
+            since_last_failure < _BATCH_THUMB_COOLDOWN
+            or _batch_thumb_in_progress
+        )
 
         if skip_batch:
             fallback = True
         else:
+            _batch_thumb_in_progress = True
             try:
                 result = await _tv_op(
                     lambda art: art.get_thumbnail_list(missing),
@@ -779,24 +784,17 @@ async def get_thumbnails_batch(body: dict):
                             break
             except Exception as e:
                 _batch_thumb_last_failure = time.monotonic()
-                log.warning("Batch thumbnail fetch failed, scheduling background prefetch: %s", e)
+                log.warning("Batch thumbnail fetch failed: %s", e)
                 fallback = True
+            finally:
+                _batch_thumb_in_progress = False
 
         if fallback:
-            # Instead of blocking the response with 20+ individual TV calls,
-            # return immediately and prefetch the missing thumbnails in the
-            # background.  The client will retry and find them cached on disk.
-            to_prefetch = [
-                cid for cid in missing
-                if cid not in encoded and cid not in _thumb_prefetch_in_progress
-            ]
-            if (
-                to_prefetch
-                and not _thumb_prefetch_running
-            ):
-                _thumb_prefetch_running = True  # set BEFORE create_task to prevent races
-                _thumb_prefetch_in_progress.update(to_prefetch)
-                asyncio.create_task(_prefetch_thumbnails(to_prefetch))
+            # Fail quietly.  Ordinary page loads must not turn a failed
+            # thumbnail request into sustained background TV traffic.
+            # Missing thumbnails remain placeholders until the user
+            # explicitly retries them.
+            pass
 
     still_missing = [c for c in missing if c not in encoded]
     return {"thumbnails": encoded, "missing": still_missing, "fallback": fallback}
